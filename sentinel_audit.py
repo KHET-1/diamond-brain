@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond NetBlade -- Zombie Auditor v1.0
+Diamond NetBlade -- Sentinel Auditor v1.0
 Three-tier automated code audit pipeline:
   Tier 1: Pattern scan (free, instant)
   Tier 2: Local LLM via LM Studio (cheap, per-file)
@@ -9,7 +9,7 @@ Three-tier automated code audit pipeline:
 Brain: Diamond Brain caches findings between runs.
 
 Usage:
-  python zombie_audit.py [options]
+  python sentinel_audit.py [options]
     --tier 1|2|3|all    Run specific tier (default: all)
     --target PATH       Target directory (default: project root)
     --verbose           Show detailed output
@@ -111,7 +111,7 @@ BANNER = f"""{_C.CYAN}{_C.BOLD}
  / /_\\\\ | | (_| | | | | | | (_) | | | | (_| | | |\\  |  __/ |_| |_) | | (_| | (_| |  __/
  \\____/_|_|\\__,_|_| |_| |_|\\___/|_| |_|\\__,_| |_| \\_|\\___|\\__|____/|_|\\__,_|\\__,_|\\___|
 {_C.RESET}
-{_C.MAGENTA}{_C.BOLD}  ZOMBIE AUDITOR v1.0{_C.RESET}{_C.DIM}  //  Three-Tier Code Audit Pipeline{_C.RESET}
+{_C.MAGENTA}{_C.BOLD}  SENTINEL AUDITOR v1.0{_C.RESET}{_C.DIM}  //  Three-Tier Code Audit Pipeline{_C.RESET}
 {_C.BLUE}  ======================================================================{_C.RESET}
 """
 
@@ -476,10 +476,34 @@ def tier1_scan(
 
 TRUTH_ENGINE_URL = "http://localhost:1234/v1/chat/completions"
 
+# ---------------------------------------------------------------------------
+# Model identifiers -- loaded via `lms load --identifier <name>`
+#   sentinel-fast  = Ministral-3-3B  (speed demon, 0.1s/question, Tier 1.5)
+#   reasoner     = DeepSeek-R1-8B  (thinking model, ~55s/file, Tier 2)
+# ---------------------------------------------------------------------------
+TRUTH_MODEL = "sentinel-fast"      # Fast non-thinking model for binary triage
+TIER2_MODEL = "reasoner"         # Reasoning model for deep file analysis
+
 TRUTH_SYSTEM = (
-    "You are a Rust code safety oracle. You will be shown a code snippet and "
-    "a concern about it. Reply with ONLY the digit 1 if the concern is a real "
-    "issue, or 0 if it is a false positive. No other text."
+    "You are a Rust code safety auditor. Reply ONLY 0 or 1.\n"
+    "0 = false positive. 1 = real issue.\n\n"
+    "RULES:\n"
+    "- .unwrap() after .is_some()/.is_ok() → 0\n"
+    "- .expect() in main() or init → 0\n"
+    "- panic! in wildcard _ arm when all enum variants are already matched → 0\n"
+    "- .unwrap() without any guard → 1\n"
+    "- Unbounded collection in infinite loop → 1\n"
+    "- O(n) operation in render/tick → 1\n\n"
+    "Examples:\n"
+    "Code: if x.is_some() { x.unwrap(); }\n"
+    "Q: dangerous? A: 0\n\n"
+    "Code: list.first().unwrap();\n"
+    "Q: dangerous? A: 1\n\n"
+    "Code: match d { Variant1 => .., Variant2 => .., _ => panic!(\"impossible\") }\n"
+    "Q: reachable panic? A: 0\n\n"
+    "Code: fn main() { f().expect(\"err\"); }\n"
+    "Q: dangerous expect? A: 0\n\n"
+    "Reply ONLY 0 or 1. No other text."
 )
 
 # Map finding categories to focused yes/no questions
@@ -500,15 +524,14 @@ _TRUTH_QUESTIONS: Dict[str, str] = {
 def _ask_truth(question: str, code_snippet: str, timeout: float = 30.0) -> Optional[bool]:
     """Ask the local LLM a binary yes/no question. Returns True (real), False (FP), or None (error)."""
     payload = {
-        "model": "zombie-auditor",
+        "model": TRUTH_MODEL,
         "messages": [
             {"role": "system", "content": TRUTH_SYSTEM},
-            {"role": "user", "content": f"Code:\n```\n{code_snippet}\n```\n\nConcern: {question}"},
+            {"role": "user", "content": f"Code: {code_snippet}\nQ: {question}\nA:"},
         ],
         "temperature": 0.0,
-        # DeepSeek R1 uses ~200 thinking tokens before the 1-digit answer.
-        # 256 is enough for thinking + answer. The actual visible output is 1 char.
-        "max_tokens": 256,
+        # Ministral-3-3B replies with a single digit — 4 tokens is plenty.
+        "max_tokens": 4,
     }
     try:
         resp = _http_post(TRUTH_ENGINE_URL, payload, timeout=timeout)
@@ -565,7 +588,7 @@ def tier1_5_truth_filter(
     try:
         _http_post(
             TRUTH_ENGINE_URL,
-            {"model": "zombie-auditor", "messages": [{"role": "user", "content": "1"}], "max_tokens": 1},
+            {"model": TRUTH_MODEL, "messages": [{"role": "user", "content": "1"}], "max_tokens": 1},
             timeout=5.0,
         )
     except Exception:
@@ -651,7 +674,7 @@ def _call_lm_studio(filepath: Path, content: str, timeout: float = 120.0) -> Lis
     user_msg = f"File: {filepath.name}\n\n```rust\n{content}\n```"
 
     payload = {
-        "model": "zombie-auditor",
+        "model": TIER2_MODEL,
         "messages": [
             {"role": "system", "content": TIER2_SYSTEM_PROMPT},
             {"role": "user", "content": user_msg},
@@ -716,7 +739,7 @@ def tier2_llm_audit(
         _http_post(
             LM_STUDIO_URL,
             {
-                "model": "zombie-auditor",
+                "model": TIER2_MODEL,
                 "messages": [{"role": "user", "content": "ping"}],
                 "max_tokens": 1,
             },
@@ -805,7 +828,7 @@ def tier2_llm_audit(
                             topic=cache_key,
                             fact=f"hash={_file_hash(abs_path)} findings={count}",
                             confidence=90,
-                            source="zombie-auditor-tier2",
+                            source="sentinel-auditor-tier2",
                         )
                 except Exception:
                     pass
@@ -1152,16 +1175,16 @@ def _print_brain_status(brain: Any, out: TextIO) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        prog="zombie_audit",
-        description="Diamond NetBlade -- Zombie Auditor v1.0: Three-tier code audit pipeline.",
+        prog="sentinel_audit",
+        description="Diamond NetBlade -- Sentinel Auditor v1.0: Three-tier code audit pipeline.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python zombie_audit.py                    # Run all tiers\n"
-            "  python zombie_audit.py --tier 1           # Pattern scan only\n"
-            "  python zombie_audit.py --tier 2 --verbose # LLM audit with detail\n"
-            "  python zombie_audit.py --brain-status     # Show brain state\n"
-            "  python zombie_audit.py --output report.txt\n"
+            "  python sentinel_audit.py                    # Run all tiers\n"
+            "  python sentinel_audit.py --tier 1           # Pattern scan only\n"
+            "  python sentinel_audit.py --tier 2 --verbose # LLM audit with detail\n"
+            "  python sentinel_audit.py --brain-status     # Show brain state\n"
+            "  python sentinel_audit.py --output report.txt\n"
         ),
     )
     parser.add_argument(
@@ -1245,7 +1268,7 @@ def main() -> int:
     # Register agent with brain
     if brain:
         try:
-            brain.agent_checkin("zombie-auditor", "code-auditor", "rust-audit")
+            brain.agent_checkin("sentinel-auditor", "code-auditor", "rust-audit")
         except Exception:
             pass
 
@@ -1286,7 +1309,7 @@ def main() -> int:
         # Report to brain
         if brain:
             try:
-                brain.agent_report("zombie-auditor", tier1_findings)
+                brain.agent_report("sentinel-auditor", tier1_findings)
             except Exception:
                 pass
     else:
@@ -1354,7 +1377,7 @@ def main() -> int:
                         topic=f.get("category", "tier2_finding"),
                         fact=f"{f.get('severity', 'MEDIUM')}: {f.get('message', '')} in {f.get('file', '?')}",
                         confidence=80,
-                        source="zombie-auditor-tier2",
+                        source="sentinel-auditor-tier2",
                     )
                 except Exception:
                     pass

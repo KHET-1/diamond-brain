@@ -1,0 +1,443 @@
+# ==========================================================================
+#  DIAMOND BRAIN CI/CD — Fractal-Parallel Testing Pipeline
+# ==========================================================================
+#  Matrix strategy: Python 3.10-3.13 x Ubuntu/macOS/Windows
+#  Zero external deps — pure stdlib, so no pip install needed
+#  Parallel tiers: syntax → import → unit tests → integration → CLI → audit
+# ==========================================================================
+
+name: Diamond CI
+
+on:
+  push:
+    branches: [main, master, "feature/**", "fix/**"]
+    paths:
+      - "brain/**"
+      - "tests/**"
+      - "seed_*.py"
+      - "sentinel_audit.py"
+      - ".github/workflows/**"
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# -----------------------------------------------------------------------
+# Jobs: parallel matrix across OS + Python versions
+# -----------------------------------------------------------------------
+jobs:
+
+  # =====================================================================
+  # TIER 0: Fast gates (syntax + import) — fail fast, save runner time
+  # =====================================================================
+  gates:
+    name: "Gate: Syntax + Import"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Syntax check
+        run: python -c "import py_compile; py_compile.compile('brain/diamond_brain.py', doraise=True)"
+
+      - name: Import check
+        run: python -c "from brain import DiamondBrain; print('OK')"
+
+      - name: Digest smoke test
+        run: |
+          python -c "
+          from brain.diamond_brain import DiamondBrain
+          b = DiamondBrain()
+          d = b.digest()
+          assert d['total_facts'] >= 0
+          assert 'diamond_link' in d
+          assert 'knowledge_graph' in d
+          print(f'Digest OK: {d[\"total_facts\"]} facts, graph={d[\"knowledge_graph\"][\"total_nodes\"]}N')
+          "
+
+  # =====================================================================
+  # TIER 1: Full test suite — matrix across Python versions
+  # =====================================================================
+  test-matrix:
+    name: "Test: Py${{ matrix.python-version }} / ${{ matrix.os }}"
+    needs: gates
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        exclude:
+          # Reduce matrix: only test all versions on Ubuntu
+          - os: macos-latest
+            python-version: "3.10"
+          - os: macos-latest
+            python-version: "3.11"
+          - os: windows-latest
+            python-version: "3.10"
+          - os: windows-latest
+            python-version: "3.11"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run 213-test suite
+        run: python -m unittest tests.test_diamond_brain -v
+
+  # =====================================================================
+  # TIER 2: Integration tests — seed data + full feature exercise
+  # =====================================================================
+  integration:
+    name: "Integration: Seed + Features"
+    needs: gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Seed forensics data
+        run: python seed_forensics.py
+
+      - name: Seed ARS criminal statutes
+        run: python seed_ars_criminal.py
+
+      - name: Verify seeded data
+        run: |
+          python -c "
+          from brain.diamond_brain import DiamondBrain
+          b = DiamondBrain()
+          d = b.digest()
+          assert d['total_facts'] >= 100, f'Expected 100+ facts, got {d[\"total_facts\"]}'
+          assert d['total_citations'] >= 50, f'Expected 50+ citations, got {d[\"total_citations\"]}'
+          print(f'Seeded: {d[\"total_facts\"]} facts, {d[\"total_citations\"]} citations')
+          "
+
+      - name: Knowledge Graph auto-index
+        run: |
+          python -c "
+          from brain.diamond_brain import DiamondBrain
+          b = DiamondBrain()
+          r = b.graph_auto_index()
+          assert r['total_nodes'] > 100, f'Expected 100+ nodes, got {r[\"total_nodes\"]}'
+          assert r['total_edges'] > 100, f'Expected 100+ edges, got {r[\"total_edges\"]}'
+          print(f'Graph: {r[\"total_nodes\"]} nodes, {r[\"total_edges\"]} edges')
+          "
+
+      - name: FSRS stats
+        run: |
+          python -c "
+          from brain.diamond_brain import DiamondBrain
+          b = DiamondBrain()
+          s = b.fsrs_stats()
+          assert s['total_facts'] > 0
+          assert s['avg_retrievability'] > 0
+          print(f'FSRS: R={s[\"avg_retrievability\"]:.2f}, due@90={s[\"due_at_90\"]}')
+          "
+
+      - name: Crystallization
+        run: |
+          python -c "
+          from brain.diamond_brain import DiamondBrain
+          b = DiamondBrain()
+          c = b.crystallize(min_cluster=5)
+          assert len(c) > 0, 'Expected crystals from seeded data'
+          print(f'Crystals: {len(c)} clusters')
+          for cr in c[:5]:
+              print(f'  {cr[\"topic\"]}: {cr[\"fact_count\"]}f, {cr[\"avg_confidence\"]:.0f}%')
+          "
+
+      - name: Contradiction detection
+        run: |
+          python -c "
+          from brain.diamond_brain import DiamondBrain
+          b = DiamondBrain()
+          c = b.detect_contradictions()
+          print(f'Contradictions: {len(c)}')
+          "
+
+      - name: Temporal reasoning
+        run: |
+          python -c "
+          from brain.diamond_brain import DiamondBrain
+          b = DiamondBrain()
+          b.temporal_add('event1', '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z')
+          b.temporal_add('event2', '2026-01-01T00:30:00Z', '2026-01-01T02:00:00Z')
+          rel = b.temporal_relation('event1', 'event2')
+          assert rel == 'overlaps', f'Expected overlaps, got {rel}'
+          chain = b.temporal_chain()
+          assert len(chain) == 2
+          print(f'Temporal: {rel}, chain={len(chain)}')
+          "
+
+      - name: Blob store
+        run: |
+          python -c "
+          from brain.diamond_brain import DiamondBrain
+          b = DiamondBrain()
+          stored = b.blob_store(b'evidence bytes', {'description': 'CI test'})
+          v = b.blob_verify(stored['hash'])
+          assert v['valid'], 'Blob integrity check failed'
+          r = b.blob_retrieve(stored['hash'])
+          assert r['content'] == b'evidence bytes'
+          print(f'Blob: {stored[\"hash\"][:16]}... verified={v[\"valid\"]}')
+          "
+
+      - name: Selective amnesia
+        run: |
+          python -c "
+          from brain.diamond_brain import DiamondBrain
+          b = DiamondBrain()
+          b.learn('_ci_test', 'CI pipeline test fact for amnesia', confidence=50)
+          r = b.forget('_ci_test', 'CI pipeline', 'CI cleanup')
+          assert r['forgotten_count'] == 1
+          r2 = b.amnesia_restore('_ci_test', 'CI pipeline')
+          assert r2['restored_count'] == 1
+          b.forget('_ci_test', 'CI pipeline', 'Final cleanup')
+          print('Amnesia: forget + restore cycle OK')
+          "
+
+      - name: Diamond Link identity
+        run: |
+          python -c "
+          from brain.diamond_brain import DiamondBrain
+          import shutil
+          b = DiamondBrain()
+          if shutil.which('openssl'):
+              identity = b.link_init('CI-Brain')
+              assert len(identity['fingerprint']) == 64
+              v = b.link_verify_custody_chain()
+              assert v['valid'], 'Custody chain broken'
+              print(f'Link: {identity[\"fingerprint\"][:16]}... custody={v[\"message\"]}')
+          else:
+              print('openssl not available, skipping link test')
+          "
+
+      - name: HTML export
+        run: |
+          python -c "
+          from brain.diamond_brain import DiamondBrain
+          b = DiamondBrain()
+          path = b.export_html('/tmp/ci_report.html')
+          import os
+          assert os.path.exists('/tmp/ci_report.html')
+          size = os.path.getsize('/tmp/ci_report.html')
+          assert size > 1000, f'HTML too small: {size}B'
+          print(f'HTML export: {size:,}B')
+          "
+
+  # =====================================================================
+  # TIER 3: CLI smoke tests — every command must not crash
+  # =====================================================================
+  cli-smoke:
+    name: "CLI: Smoke Tests"
+    needs: gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Seed data for CLI tests
+        run: |
+          python seed_forensics.py
+          python seed_ars_criminal.py
+
+      - name: CLI -- default digest
+        run: python -m brain.diamond_brain 2>&1 | head -10
+
+      - name: CLI --recall
+        run: python -m brain.diamond_brain --recall forensics-tools-disk
+
+      - name: CLI --search
+        run: python -m brain.diamond_brain --search autopsy
+
+      - name: CLI --learn + --prune
+        run: |
+          python -m brain.diamond_brain --learn ci-test "CI test fact" 50 ci
+          python -m brain.diamond_brain --prune 1 90
+
+      - name: CLI --citations
+        run: python -m brain.diamond_brain --citations murder --severity FELONY
+
+      - name: CLI --citation-stats
+        run: python -m brain.diamond_brain --citation-stats
+
+      - name: CLI --visual
+        run: python -m brain.diamond_brain --visual
+
+      - name: CLI --html
+        run: python -m brain.diamond_brain --html /tmp/cli_test.html
+
+      - name: CLI --graph-index + --graph-stats
+        run: |
+          python -m brain.diamond_brain --graph-index
+          python -m brain.diamond_brain --graph-stats
+
+      - name: CLI --graph-query
+        run: python -m brain.diamond_brain --graph-query forensics --depth 2
+
+      - name: CLI --fsrs-stats + --fsrs-due
+        run: |
+          python -m brain.diamond_brain --fsrs-stats
+          python -m brain.diamond_brain --fsrs-due
+
+      - name: CLI --contradictions
+        run: python -m brain.diamond_brain --contradictions
+
+      - name: CLI --crystallize
+        run: python -m brain.diamond_brain --crystallize
+
+      - name: CLI --temporal
+        run: |
+          python -m brain.diamond_brain --temporal-add evt1 2026-01-01T00:00:00Z 2026-01-01T01:00:00Z
+          python -m brain.diamond_brain --temporal-add evt2 2026-01-01T02:00:00Z 2026-01-01T03:00:00Z
+          python -m brain.diamond_brain --temporal-relation evt1 evt2
+          python -m brain.diamond_brain --temporal-chain
+
+      - name: CLI --amnesia
+        run: |
+          python -m brain.diamond_brain --learn _cli_amnesia "Forget me" 50 cli
+          python -m brain.diamond_brain --forget _cli_amnesia "Forget" "CLI test"
+          python -m brain.diamond_brain --amnesia-log
+
+      - name: CLI --blob
+        run: |
+          echo "CI evidence" > /tmp/evidence.txt
+          python -m brain.diamond_brain --blob-store /tmp/evidence.txt --description "CI test blob"
+          python -m brain.diamond_brain --blob-list
+
+      - name: CLI --link
+        run: |
+          python -m brain.diamond_brain --link-init "CI-Brain"
+          python -m brain.diamond_brain --link-identity
+          python -m brain.diamond_brain --link-status
+          python -m brain.diamond_brain --link-peers
+          python -m brain.diamond_brain --link-log
+          python -m brain.diamond_brain --link-custody
+          python -m brain.diamond_brain --link-custody --verify
+
+      - name: CLI --command-stats
+        run: |
+          python -m brain.diamond_brain --log-command "git push --force"
+          python -m brain.diamond_brain --suggest "git push"
+          python -m brain.diamond_brain --command-stats
+
+  # =====================================================================
+  # TIER 4: Security + quality checks
+  # =====================================================================
+  security:
+    name: "Security: No Secrets + No eval"
+    needs: gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No eval/exec in brain module
+        run: |
+          if grep -rn 'eval\s*(' brain/ --include="*.py" | grep -v '#.*eval' | grep -v 'test'; then
+            echo "FAIL: eval() found in brain module"
+            exit 1
+          fi
+          if grep -rn 'exec\s*(' brain/ --include="*.py" | grep -v '#.*exec' | grep -v 'test'; then
+            echo "FAIL: exec() found in brain module"
+            exit 1
+          fi
+          echo "No eval/exec found. Clean."
+
+      - name: No hardcoded secrets
+        run: |
+          if grep -rni 'password\s*=\s*["\x27]' brain/ --include="*.py"; then
+            echo "FAIL: Hardcoded password found"
+            exit 1
+          fi
+          echo "No hardcoded secrets. Clean."
+
+      - name: No external imports in brain module
+        run: |
+          python -c "
+          import ast, sys
+          STDLIB = {
+              'hashlib', 'json', 'math', 'os', 'shlex', 'textwrap',
+              'pathlib', 'datetime', 'difflib', 'ssl', 'hmac', 'secrets',
+              'socket', 'shutil', 'subprocess', 'time', 'urllib',
+              'urllib.request', 'urllib.error', 'sys', 'threading',
+          }
+          with open('brain/diamond_brain.py') as f:
+              tree = ast.parse(f.read())
+          violations = []
+          for node in ast.walk(tree):
+              if isinstance(node, ast.Import):
+                  for alias in node.names:
+                      if alias.name.split('.')[0] not in STDLIB:
+                          violations.append(alias.name)
+              elif isinstance(node, ast.ImportFrom):
+                  if node.module and node.module.split('.')[0] not in STDLIB:
+                      violations.append(node.module)
+          if violations:
+              print(f'FAIL: Non-stdlib imports: {violations}')
+              sys.exit(1)
+          print('All imports are stdlib. Clean.')
+          "
+
+      - name: Atomic writes verified
+        run: |
+          python -c "
+          import ast
+          with open('brain/diamond_brain.py') as f:
+              source = f.read()
+          # Every _save method should use os.replace
+          assert 'os.replace' in source, 'Missing os.replace for atomic writes'
+          assert '.with_suffix(\".tmp\")' in source, 'Missing .tmp pattern for atomic writes'
+          print('Atomic write pattern verified.')
+          "
+
+      - name: No banned terminology
+        run: |
+          if grep -ni 'zombie' brain/diamond_brain.py | grep -v '#' | grep -v 'historical'; then
+            echo "WARN: Found 'zombie' in brain module (Rule 5)"
+          fi
+          echo "Terminology check complete."
+
+  # =====================================================================
+  # Summary — all tiers must pass
+  # =====================================================================
+  diamond-complete:
+    name: "Diamond Complete"
+    needs: [gates, test-matrix, integration, cli-smoke, security]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check all tiers
+        run: |
+          echo "=== DIAMOND CI RESULTS ==="
+          echo "Gates:       ${{ needs.gates.result }}"
+          echo "Test Matrix: ${{ needs.test-matrix.result }}"
+          echo "Integration: ${{ needs.integration.result }}"
+          echo "CLI Smoke:   ${{ needs.cli-smoke.result }}"
+          echo "Security:    ${{ needs.security.result }}"
+
+          if [ "${{ needs.gates.result }}" != "success" ] || \
+             [ "${{ needs.test-matrix.result }}" != "success" ] || \
+             [ "${{ needs.integration.result }}" != "success" ] || \
+             [ "${{ needs.cli-smoke.result }}" != "success" ] || \
+             [ "${{ needs.security.result }}" != "success" ]; then
+            echo "PIPELINE FAILED"
+            exit 1
+          fi
+
+          echo ""
+          echo "  ◆◆◆ ALL TIERS PASSED — DIAMOND HANDS ◆◆◆"
