@@ -9,7 +9,6 @@
   All data persisted as JSON on disk. No external dependencies.
 
   Owner: Ryan Cashmoney (@Tunclon)
-  Origin: Modeled after rathin_utils.brain.Brain from the Parrot Linux rig.
   Adapted for cross-platform with zero dependencies.
 ================================================================================
 """
