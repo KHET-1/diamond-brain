@@ -14,18 +14,33 @@
 """
 
 import hashlib
+import io
 import json
 import math
 import os
 import shlex
 import secrets
 import statistics
+import sys
 import textwrap
 import time
 from pathlib import Path
 from datetime import datetime, timezone
 from difflib import SequenceMatcher, get_close_matches
 
+# ---------------------------------------------------------------------------
+# UTF-8 safety — ensure stdout/stderr handle Unicode on all platforms
+# ---------------------------------------------------------------------------
+# On Windows or terminals with ASCII encoding, Python may default to a codec
+# that chokes on box-drawing or emoji characters.  Reconfigure to UTF-8 with
+# 'replace' error handling so the worst case is a '?' instead of a crash.
+for _stream_name in ("stdout", "stderr"):
+    _stream = getattr(sys, _stream_name, None)
+    if _stream and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass  # some environments (e.g. IDLE) don't support reconfigure
 
 # ---------------------------------------------------------------------------
 # ANSI helpers — degrade gracefully on terminals that strip escapes
@@ -84,7 +99,7 @@ BANNER = f"""
 {_C.CYAN}                      ◆{_C.GOLD}◆◆{_C.CYAN}◆{_C.RESET}
 {_C.CYAN}                        {_C.BOLD}◆{_C.RESET}
 {_C.CYAN}{_C.BOLD}  ╔══════════════════════════════════════════════════════════════╗{_C.RESET}
-{_C.CYAN}{_C.BOLD}  ║{_C.RESET}{_C.WHITE}{_C.BOLD}          D I A M O N D    B R A I N   v 2 . 0{_C.RESET}{_C.CYAN}{_C.BOLD}             ║{_C.RESET}
+{_C.CYAN}{_C.BOLD}  ║{_C.RESET}{_C.WHITE}{_C.BOLD}          D I A M O N D    B R A I N   v 3 . 0{_C.RESET}{_C.CYAN}{_C.BOLD}             ║{_C.RESET}
 {_C.CYAN}{_C.BOLD}  ║{_C.RESET}{_C.DIM}          Knowledge  +  Legal Intelligence System{_C.RESET}{_C.CYAN}{_C.BOLD}          ║{_C.RESET}
 {_C.CYAN}{_C.BOLD}  ╚══════════════════════════════════════════════════════════════╝{_C.RESET}
 """
