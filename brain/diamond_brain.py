@@ -6567,11 +6567,47 @@ function downloadCourtDoc() {{
         return bundle
 
     # ==================================================================
-    #  Embedding Store (nomic-embed-text via LM Studio)
+    #  LM Studio SDK Client (singleton, lazy-init)
     # ==================================================================
 
-    _LM_EMBED_URL = "http://localhost:1234/v1/embeddings"
-    _LM_EMBED_MODEL = "nomic-embed-text-v1.5"
+    _LM_EMBED_MODEL = "text-embedding-nomic-embed-text-v1.5"
+    _LM_CHAT_URL = "http://localhost:1234/v1/chat/completions"
+    _LM_NATIVE_CHAT_URL = "http://localhost:1234/api/v1/chat"
+
+    # Module-level singleton — avoids reconnect overhead per call
+    _lms_client_instance: "object | None" = None
+    _lms_available: "bool | None" = None  # None = unchecked
+
+    @classmethod
+    def _lms_client(cls) -> "object | None":
+        """Return a cached lmstudio.Client, or None if SDK unavailable."""
+        if cls._lms_available is False:
+            return None
+        try:
+            import lmstudio as lms
+            if cls._lms_client_instance is None:
+                lms.set_sync_api_timeout(30)
+                cls._lms_client_instance = lms.Client()
+                cls._lms_available = True
+            return cls._lms_client_instance
+        except Exception:
+            cls._lms_available = False
+            return None
+
+    @classmethod
+    def _lms_close(cls) -> None:
+        """Close cached SDK client (call on shutdown if needed)."""
+        if cls._lms_client_instance is not None:
+            try:
+                cls._lms_client_instance.close()
+            except Exception:
+                pass
+            cls._lms_client_instance = None
+            cls._lms_available = None
+
+    # ==================================================================
+    #  Embedding Store (nomic-embed-text via LM Studio SDK)
+    # ==================================================================
 
     def _emb_path(self) -> "Path":
         return self.memory_dir / "embeddings.json"
@@ -6594,16 +6630,29 @@ function downloadCourtDoc() {{
         os.replace(str(tmp), str(p))
 
     def _embed(self, text: str) -> "list[float] | None":
-        """Call LM Studio embeddings API. Returns vector or None on error."""
+        """Embed text via LM Studio SDK (nomic-embed-text-v1.5).
+
+        Falls back to REST if SDK unavailable. Returns None on error.
+        """
+        client = self._lms_client()
+        if client is not None:
+            try:
+                import lmstudio as lms
+                emb_model = client.embedding.model(self._LM_EMBED_MODEL)
+                vec = emb_model.embed(text[:4096])
+                return list(vec) if vec is not None else None
+            except Exception:
+                pass
+
+        # REST fallback
         import urllib.request
         import urllib.error
-
         payload = json.dumps({
             "model": self._LM_EMBED_MODEL,
             "input": text[:4096],
         }).encode()
         req = urllib.request.Request(
-            self._LM_EMBED_URL,
+            "http://localhost:1234/v1/embeddings",
             data=payload,
             headers={"Content-Type": "application/json"},
         )
@@ -6611,8 +6660,7 @@ function downloadCourtDoc() {{
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode())
             return data["data"][0]["embedding"]
-        except (urllib.error.URLError, json.JSONDecodeError,
-                KeyError, IndexError, OSError, TimeoutError):
+        except Exception:
             return None
 
     @staticmethod
@@ -7068,26 +7116,68 @@ function downloadCourtDoc() {{
                        encoding="utf-8")
         os.replace(str(tmp), str(path))
 
-    # Model routing — fast for short tasks, reasoner for deep analysis
-    _LM_FAST_MODEL = "sentinel-fast"         # Ministral-3B
-    _LM_REASON_MODEL = "deepseek-r1-8b"      # DeepSeek-R1-8B
-    _LM_CHAT_URL = "http://localhost:1234/v1/chat/completions"
+    # Model routing — single Mistral for now; swap _LM_REASON_MODEL for
+    # a larger model once downloaded (e.g. deepseek-r1)
+    _LM_FAST_MODEL = "mistralai/mistral-7b-instruct-v0.3"
+    _LM_REASON_MODEL = "mistralai/mistral-7b-instruct-v0.3"
 
     def _cortex_chat(self, messages: list[dict],
                      temperature: float = 0.3,
                      max_tokens: int = 2000,
                      model: str | None = None) -> str | None:
-        """Send chat completion request to LM Studio. Returns text or None.
+        """Send chat completion via LM Studio SDK or REST fallback.
 
-        model: explicit model override; defaults to _LM_FAST_MODEL.
-        Use _LM_REASON_MODEL for multi-step reasoning tasks.
+        Merges the system prompt into the first user message because
+        Mistral's jinja template only accepts user/assistant roles.
+        model: override; defaults to _LM_FAST_MODEL.
         """
+        target = model or self._LM_FAST_MODEL
+
+        # Flatten: extract system prompt + build user-only history
+        system_text = ""
+        user_messages: list[dict] = []
+        for m in messages:
+            if m.get("role") == "system":
+                system_text = m.get("content", "")
+            else:
+                user_messages.append(m)
+
+        # Prepend system instructions to first user message
+        if system_text and user_messages:
+            first = user_messages[0]
+            user_messages[0] = {
+                "role": first["role"],
+                "content": f"[INSTRUCTIONS]\n{system_text}\n\n"
+                           f"[MESSAGE]\n{first['content']}",
+            }
+
+        # --- SDK path ---
+        client = self._lms_client()
+        if client is not None:
+            try:
+                import lmstudio as lms
+                chat = lms.Chat()
+                for m in user_messages:
+                    if m["role"] == "user":
+                        chat.add_user_message(m["content"])
+                    elif m["role"] == "assistant":
+                        chat.add_assistant_response(m["content"])
+                llm = client.llm.model(target)
+                result = llm.respond(
+                    chat,
+                    config={"temperature": temperature,
+                            "maxTokens": max_tokens},
+                )
+                return result.content.strip() if result.content else None
+            except Exception:
+                pass  # fall through to REST
+
+        # --- REST fallback ---
         import urllib.request
         import urllib.error
-
         payload = json.dumps({
-            "model": model or self._LM_FAST_MODEL,
-            "messages": messages,
+            "model": target,
+            "messages": user_messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
         }).encode()
@@ -7101,8 +7191,7 @@ function downloadCourtDoc() {{
                 data = json.loads(resp.read().decode())
             content = data["choices"][0]["message"]["content"]
             return content.strip() if content else None
-        except (urllib.error.URLError, json.JSONDecodeError,
-                KeyError, IndexError, OSError, TimeoutError):
+        except Exception:
             return None
 
     def _cortex_system_prompt(self) -> str:
@@ -8076,6 +8165,92 @@ function downloadCourtDoc() {{
             "brief": brief,
             "sections": brief_sections,
             "model": "fallback",
+            "fallback": True,
+        }
+
+    def cortex_act(self, task: str,
+                   mcp_servers: list[dict] | None = None,
+                   model: str | None = None,
+                   max_tokens: int = 2000) -> dict:
+        """MCP-enabled agentic task via LM Studio native /api/v1/chat.
+
+        mcp_servers: list of ephemeral MCP integration dicts, e.g.:
+          [{"type": "ephemeral_mcp", "server_label": "playwright",
+            "server_url": "http://localhost:3000/mcp",
+            "allowed_tools": ["browser_navigate", "browser_snapshot"]}]
+
+        Falls back to cortex_ask() when MCP servers not provided or
+        when the native endpoint is unavailable.
+
+        Returns {"output": [...], "response_id": "...", "stats": {...},
+                 "model": "...", "fallback": bool}
+        """
+        import urllib.request
+        import urllib.error
+
+        t0 = time.time()
+        target = model or self._LM_FAST_MODEL
+
+        # Build RAG context for the task
+        context = self._cortex_build_context(task, max_facts=10)
+        full_input = (f"KNOWLEDGE BASE CONTEXT:\n{context}\n\n"
+                      f"TASK: {task}") if context else task
+
+        integrations = mcp_servers or []
+        payload = json.dumps({
+            "model": target,
+            "input": full_input,
+            "stream": False,
+            "max_output_tokens": max_tokens,
+            "temperature": 0.3,
+            "integrations": integrations,
+        }).encode()
+        req = urllib.request.Request(
+            self._LM_NATIVE_CHAT_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode())
+            elapsed_ms = int((time.time() - t0) * 1000)
+            output = data.get("output", [])
+            response_id = data.get("response_id", "")
+            stats = data.get("stats", {})
+
+            # Extract text content from output array
+            text_parts = [
+                item.get("content", "") for item in output
+                if item.get("type") == "message"
+            ]
+            answer = "\n".join(text_parts).strip()
+
+            self._cortex_track_query("act", "lm_studio_native",
+                                     stats.get("total_output_tokens", 0),
+                                     elapsed_ms, question=task[:80])
+            return {
+                "answer": answer,
+                "output": output,
+                "response_id": response_id,
+                "stats": stats,
+                "model": target,
+                "mcp_servers": [s.get("server_label", "?")
+                                for s in integrations],
+                "fallback": False,
+            }
+        except Exception:
+            pass
+
+        # Fallback to cortex_ask
+        elapsed_ms = int((time.time() - t0) * 1000)
+        ask_result = self.cortex_ask(task)
+        return {
+            "answer": ask_result.get("answer", ""),
+            "output": [],
+            "response_id": "",
+            "stats": {},
+            "model": ask_result.get("model", "fallback"),
+            "mcp_servers": [],
             "fallback": True,
         }
 
@@ -10623,6 +10798,34 @@ if __name__ == "__main__":
         print(f"\n{_section_header('Case Brief', _C.SCALE, _C.MAGENTA)}")
         print(result["brief"])
         print()
+        sys.exit(0)
+
+    # CLI: --cortex-act <task> [--mcp <server_url> <label>]
+    if len(sys.argv) >= 3 and sys.argv[1] == "--cortex-act":
+        mcp_list: list[dict] = []
+        args_copy = sys.argv[2:]
+        if "--mcp" in args_copy:
+            idx = args_copy.index("--mcp")
+            if idx + 2 < len(args_copy):
+                mcp_list = [{
+                    "type": "ephemeral_mcp",
+                    "server_url": args_copy[idx + 1],
+                    "server_label": args_copy[idx + 2],
+                }]
+                args_copy = args_copy[:idx]
+        act_task = " ".join(args_copy)
+        result = brain.cortex_act(act_task, mcp_servers=mcp_list or None)
+        print(f"\n{_section_header('Cortex Act', _C.DIAMOND, _C.MAGENTA)}")
+        fb = f" {_C.YELLOW}[FALLBACK]{_C.RESET}" if result["fallback"] else ""
+        print(f"    {_C.WHITE}{_C.BOLD}Model  :{_C.RESET}  {result['model']}{fb}")
+        if result["mcp_servers"]:
+            print(f"    {_C.WHITE}{_C.BOLD}MCP    :{_C.RESET}  "
+                  f"{', '.join(result['mcp_servers'])}")
+        if result.get("stats"):
+            s = result["stats"]
+            tps = s.get("tokens_per_second", 0)
+            print(f"    {_C.WHITE}{_C.BOLD}Speed  :{_C.RESET}  {tps:.1f} tok/s")
+        print(f"\n{result['answer']}\n")
         sys.exit(0)
 
     # CLI: --cortex-status
