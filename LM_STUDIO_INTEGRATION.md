@@ -13,7 +13,7 @@ Diamond Brain's Neural Cortex is wired to a local LM Studio inference stack runn
 |------|-------|------|----------------|
 | Embedder | nomic-embed-text-v1.5 | 84 MB | `text-embedding-nomic-embed-text-v1.5` |
 | Fast LLM | Mistral-7B-Instruct-v0.3 | 4.1 GB | `mistralai/mistral-7b-instruct-v0.3` |
-| Reasoner / Tools | Qwen2.5-Coder-7B-Instruct | 4.4 GB | `lmstudio-community/qwen2.5-coder-7b-instruct-gguf` |
+| Reasoner / Tools | Qwen2.5-Coder-7B-Instruct | 4.4 GB | `qwen2.5-coder-7b-instruct` |
 
 ### Why These Models
 
@@ -117,7 +117,7 @@ Vectors stored in `memory/embeddings.json` as `{fact_key: [float, ...]}`. Atomic
 ### Model Constants
 ```python
 DiamondBrain._LM_FAST_MODEL    = "mistralai/mistral-7b-instruct-v0.3"
-DiamondBrain._LM_REASON_MODEL  = "lmstudio-community/qwen2.5-coder-7b-instruct-gguf"
+DiamondBrain._LM_REASON_MODEL  = "qwen2.5-coder-7b-instruct"
 DiamondBrain._LM_EMBED_MODEL   = "text-embedding-nomic-embed-text-v1.5"
 DiamondBrain._LM_CHAT_URL      = "http://localhost:1234/v1/chat/completions"
 DiamondBrain._LM_NATIVE_CHAT_URL = "http://localhost:1234/api/v1/chat"
@@ -216,6 +216,8 @@ Location: `~/.lmstudio/mcp.json`
 
 Use in API requests: `"integrations": [{"type": "plugin", "id": "mcp/fetch"}]`
 
+**Note:** `plugin` type requires LM Studio server auth to have plugin permissions enabled (Developer → Server Settings → "Allow Plugin Usage"). Without auth configured, this returns `"Permission denied to use plugin"`. Use `ephemeral_mcp` for programmatic/API access — it works without any server auth configuration.
+
 ### cortex_act() — Agentic MCP Execution
 ```python
 result = brain.cortex_act(
@@ -304,7 +306,7 @@ Available HF tools: `hf_whoami`, `space_search`, `hub_repo_search`, `paper_searc
 curl http://localhost:1234/api/v1/chat \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "lmstudio-community/qwen2.5-coder-7b-instruct-gguf",
+    "model": "qwen2.5-coder-7b-instruct",
     "input": "Summarise the fraud evidence",
     "stream": false,
     "max_output_tokens": 2000,
@@ -381,6 +383,7 @@ python3 -m pytest tests/ -q
 | Mistral can't use MCP tool injection | Use Qwen as `_LM_REASON_MODEL` for `cortex_act()` |
 | SDK `Chat` no system role | Same merge — handled transparently |
 | Qwen model ID is coder variant | Works for all tasks; swap for `qwen2.5-7b-instruct` when available |
+| `plugin` MCP type returns Permission Denied | Enable plugin permissions in LM Studio Developer settings, or use `ephemeral_mcp` instead |
 | embeddings.json can grow large | 314 facts ≈ 1.8 MB; trim via `embed_facts(max_facts=N)` |
 
 ---
@@ -391,7 +394,7 @@ When a better model is downloaded, update two class constants:
 ```python
 # In diamond_brain.py (~line 7100)
 _LM_FAST_MODEL = "mistralai/mistral-7b-instruct-v0.3"
-_LM_REASON_MODEL = "lmstudio-community/qwen2.5-coder-7b-instruct-gguf"
+_LM_REASON_MODEL = "qwen2.5-coder-7b-instruct"
 ```
 
 Recommended upgrades:

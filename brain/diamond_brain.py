@@ -7130,7 +7130,7 @@ function downloadCourtDoc() {{
 
     # Model routing: Mistral for fast chat, Qwen2.5-Coder for tool-use/MCP tasks
     _LM_FAST_MODEL = "mistralai/mistral-7b-instruct-v0.3"
-    _LM_REASON_MODEL = "lmstudio-community/qwen2.5-coder-7b-instruct-gguf"
+    _LM_REASON_MODEL = "qwen2.5-coder-7b-instruct"
 
     def _cortex_chat(self, messages: list[dict],
                      temperature: float = 0.3,
