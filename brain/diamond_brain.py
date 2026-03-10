@@ -6578,6 +6578,24 @@ function downloadCourtDoc() {{
     _lms_client_instance: "object | None" = None
     _lms_available: "bool | None" = None  # None = unchecked
 
+    # Token tracker singleton — writes to rathin_utils TokenTracker on disk
+    _token_tracker_instance: "object | None" = None
+
+    @classmethod
+    def _token_tracker(cls) -> "object | None":
+        """Lazy-init TokenTracker from rathin_utils. Silent if unavailable."""
+        if cls._token_tracker_instance is not None:
+            return cls._token_tracker_instance
+        try:
+            import sys as _sys
+            _sys.path.insert(0, str(Path.home() / "projects" / "lib"))
+            from rathin_utils.token_tracker import TokenTracker
+            cls._token_tracker_instance = TokenTracker()
+            cls._token_tracker_instance.start_action("lm_studio_session")
+            return cls._token_tracker_instance
+        except Exception:
+            return None
+
     @classmethod
     def _lms_client(cls) -> "object | None":
         """Return a cached lmstudio.Client, or None if SDK unavailable."""
@@ -7201,6 +7219,18 @@ function downloadCourtDoc() {{
             with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode())
             content = data["choices"][0]["message"]["content"]
+            usage = data.get("usage", {})
+            tracker = self._token_tracker()
+            if tracker is not None:
+                try:
+                    tracker.log_api_call(
+                        model=target,
+                        input_tokens=usage.get("prompt_tokens", 0),
+                        output_tokens=usage.get("completion_tokens", 0),
+                    )
+                    tracker._save_history()
+                except Exception:
+                    pass
             return content.strip() if content else None
         except Exception:
             return None
@@ -7479,8 +7509,9 @@ function downloadCourtDoc() {{
     def _cortex_track_query(self, method: str, model: str,
                             tokens: int, response_ms: int,
                             question: str = "",
-                            fallback: bool = False) -> None:
-        """Track cortex usage stats."""
+                            fallback: bool = False,
+                            input_tokens: int = 0) -> None:
+        """Track cortex usage stats — internal log + external TokenTracker."""
         log = self._cortex_log_load()
         log["total_queries"] = log.get("total_queries", 0) + 1
         log["total_tokens"] = log.get("total_tokens", 0) + tokens
@@ -7490,12 +7521,28 @@ function downloadCourtDoc() {{
             "question": question[:200],
             "model": model,
             "tokens": tokens,
+            "input_tokens": input_tokens,
             "response_ms": response_ms,
             "fallback": fallback,
             "timestamp": _now_iso(),
         })
         log["queries"] = log["queries"][-500:]
         self._cortex_log_save(log)
+
+        # Forward to rathin_utils TokenTracker for cross-session accounting
+        tracker = self._token_tracker()
+        if tracker is not None:
+            try:
+                tracker.log_api_call(
+                    model=model,
+                    input_tokens=input_tokens,
+                    output_tokens=tokens,
+                    latency_ms=float(response_ms),
+                    success=not fallback,
+                )
+                tracker._save_history()
+            except Exception:
+                pass
 
     @staticmethod
     def _cortex_parse_json_list(text: str) -> list[dict]:
@@ -8238,7 +8285,8 @@ function downloadCourtDoc() {{
 
             self._cortex_track_query("act", "lm_studio_native",
                                      stats.get("total_output_tokens", 0),
-                                     elapsed_ms, question=task[:80])
+                                     elapsed_ms, question=task[:80],
+                                     input_tokens=stats.get("input_tokens", 0))
             return {
                 "answer": answer,
                 "output": output,
