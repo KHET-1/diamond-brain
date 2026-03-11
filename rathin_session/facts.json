@@ -1,0 +1,62 @@
+[
+  {
+    "topic": "md-reader-instances",
+    "fact": "MD Reader Pro Canonical — v4.0.0 at ~/md-reader-pro. Stage: Production-ready. Language: JS+Rust. Feature: Compiled diamond binary.",
+    "confidence": 95,
+    "source": "diamond-inventory-scan",
+    "verified": true,
+    "created_at": "2026-03-02T23:59:05.666284+00:00",
+    "updated_at": "2026-03-02T23:59:11.221333+00:00",
+    "links": []
+  },
+  {
+    "topic": "md-reader-instances",
+    "fact": "MD Reader Pro TypeScript — v3.0.0 at SoftwareX/MDReader PRO. Stage: Almost-complete. Language: TS+JS. Feature: vitest, webpack.",
+    "confidence": 95,
+    "source": "diamond-inventory-scan",
+    "verified": true,
+    "created_at": "2026-03-02T23:59:05.666748+00:00",
+    "updated_at": "2026-03-02T23:59:11.222531+00:00",
+    "links": []
+  },
+  {
+    "topic": "md-reader-instances",
+    "fact": "MD Reader Pro Nexus — v4.0.0 at SoftwareX/Nexus/.../md-reader-pro. Stage: Production. Language: JS+Rust. Feature: Built dist/.",
+    "confidence": 95,
+    "source": "diamond-inventory-scan",
+    "verified": true,
+    "created_at": "2026-03-02T23:59:05.668327+00:00",
+    "updated_at": "2026-03-02T23:59:11.224975+00:00",
+    "links": []
+  },
+  {
+    "topic": "md-reader-instances",
+    "fact": "MD Reader Pro fixdeps — v3.4.1 at C4E/.../fixdeps/md-reader-pro. Stage: Frozen. Language: JS. Feature: Security fixes.",
+    "confidence": 95,
+    "source": "diamond-inventory-scan",
+    "verified": true,
+    "created_at": "2026-03-02T23:59:05.670191+00:00",
+    "updated_at": "2026-03-02T23:59:11.226966+00:00",
+    "links": []
+  },
+  {
+    "topic": "md-reader-instances",
+    "fact": "MD Reader Pro Legacy — v1.0.0 at C4E/.../ryans.games/Projects/MDReaderPro. Stage: Legacy. Language: JS. Feature: Ultra Mega 3000.",
+    "confidence": 95,
+    "source": "diamond-inventory-scan",
+    "verified": true,
+    "created_at": "2026-03-02T23:59:05.672790+00:00",
+    "updated_at": "2026-03-02T23:59:11.229720+00:00",
+    "links": []
+  },
+  {
+    "topic": "md-reader-instances",
+    "fact": "MD Reader Pro React — v3.1.0 at C4E/.../Downloads/MD_READER_PRO_PREVIEW_V1. Stage: Experimental. Language: JSX. Feature: Design concept.",
+    "confidence": 95,
+    "source": "diamond-inventory-scan",
+    "verified": true,
+    "created_at": "2026-03-02T23:59:05.676767+00:00",
+    "updated_at": "2026-03-02T23:59:11.234744+00:00",
+    "links": []
+  }
+]

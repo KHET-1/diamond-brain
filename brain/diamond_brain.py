@@ -260,9 +260,22 @@ class DiamondBrain:
 
     DEFAULT_MEMORY_DIR = Path(__file__).resolve().parent / "memory"
 
-    def __init__(self, memory_dir: Path | str | None = None):
+    def __init__(self, memory_dir: Path | str | None = None,
+                 stream_passphrase: str | None = None):
         self.memory_dir = Path(memory_dir) if memory_dir else self.DEFAULT_MEMORY_DIR
         self.memory_dir.mkdir(parents=True, exist_ok=True)
+
+        # ── Memory stream (optional encrypted append log) ──────────────
+        self._stream = None
+        if stream_passphrase:
+            try:
+                import sys as _sys
+                _sys.path.insert(0, str(Path(__file__).parent))
+                from memory_stream import MemoryStream
+                self._stream = MemoryStream(self.memory_dir, stream_passphrase)
+                self._stream.open_session()
+            except Exception as _e:
+                pass  # stream is optional — never break the brain
 
         self._facts_path = self.memory_dir / "facts.json"
         self._agents_path = self.memory_dir / "agents.json"
@@ -275,13 +288,35 @@ class DiamondBrain:
         self._amnesia_path = self.memory_dir / "amnesia.json"
         self._blobs_dir = self.memory_dir / "blobs"
         self._sources_path = self.memory_dir / "sources.json"
+        self._coord_path = self.memory_dir / "coordination.json"
+
+        # Session-level provisional mode — set True when Diamond Link drops
+        # mid-session; all facts/claims learned after drop are tagged provisional.
+        self._session_provisional: bool = False
+        self._session_id: str = _now_iso()
 
         # Ensure files exist
         for p in (self._facts_path, self._agents_path, self._escalations_path,
                   self._commands_path, self._citations_path, self._temporal_path,
-                  self._amnesia_path, self._sources_path):
+                  self._amnesia_path, self._sources_path, self._coord_path):
             if not p.exists():
                 p.write_text("[]", encoding="utf-8")
+
+    def stream_close(self, tokens_used: int = 0) -> None:
+        """Flush and close the memory stream for this session."""
+        if self._stream:
+            try:
+                self._stream.close_session(tokens_used=tokens_used)
+            except Exception:
+                pass
+
+    def _stream_append(self, **kwargs) -> None:
+        """Fire-and-forget stream event. Silent no-op if stream not active."""
+        if self._stream:
+            try:
+                self._stream.append(**kwargs)
+            except Exception:
+                pass  # never let stream errors surface to caller
 
     # ------------------------------------------------------------------
     # Internal I/O
@@ -361,7 +396,10 @@ class DiamondBrain:
                 m["source_weighted_confidence"] = float(m.get("confidence", 0))
 
         matches.sort(key=lambda f: f.get("effective_confidence", 0), reverse=True)
-        return matches[:max_results]
+        result = matches[:max_results]
+        self._stream_append(op="RECALL", topic=topic, content="",
+                            result_ids=[f.get("_crdt", {}).get("id", "") for f in result])
+        return result
 
     # ------------------------------------------------------------------
     # advanced_recall — deep search with association chaining
@@ -423,20 +461,113 @@ class DiamondBrain:
         confidence: int = 90,
         source: str = "auto",
         verified: bool = False,
+        fact_class: str = "B",
     ) -> dict:
-        """Store a fact. If a >80 percent similar fact already exists for the
-        same topic, update it instead of creating a duplicate."""
+        """Store a fact.
+
+        fact_class controls merge and conflict behaviour:
+          "A" — Evidence. Append-only. Never silently overwritten. Conflicts
+                between brains are logged in coordination.json for human review.
+          "B" — Working (default). Fuzzy-dedup updates in place; higher
+                confidence wins on sync; loser is archived, not deleted.
+          "C" — Coordination. See coord_claim() for the preferred interface.
+                Stored as regular facts but never dedup-merged.
+
+        If a >80 percent similar fact already exists for the same topic,
+        update it instead of creating a duplicate (Class B only).
+        """
+        fact_class = fact_class.upper() if fact_class else "B"
         facts = self._load(self._facts_path)
         now = _now_iso()
 
-        # Check for existing similar fact under the same topic
+        # Class A — append-only: idempotent skip if same content,
+        # conflict log if different content on same topic
+        if fact_class == "A":
+            for existing in facts:
+                if existing.get("topic", "").lower() != topic.lower():
+                    continue
+                if existing.get("fact_class", "B") != "A":
+                    continue
+                if existing.get("_crdt", {}).get("tombstone"):
+                    continue
+                sim = _similarity(existing.get("fact", ""), fact)
+                if sim > 0.98:
+                    # Near-exact match — idempotent; return existing without appending.
+                    # Threshold is 0.98 (not 0.80) because Class A facts where only
+                    # a single key detail differs (email, name, date) are forensically
+                    # distinct facts that must both be preserved and flagged.
+                    return existing
+                # Different content on same topic → log conflict, then append
+                self._coord_log_conflict(
+                    topic=topic,
+                    local_fact_id=existing.get("_crdt", {}).get("id", "?"),
+                    incoming_fact=fact,
+                    incoming_source=source,
+                    conflict_type="intra-brain",
+                )
+                break  # One conflict record per learn() call is sufficient
+            # Append as a new, independent Class A attestation
+            entry = {
+                "topic": topic,
+                "fact": fact,
+                "fact_class": "A",
+                "confidence": confidence,
+                "source": source,
+                "verified": verified,
+                "created_at": now,
+                "updated_at": now,
+                "links": [],
+                "archived": False,
+                "provisional": self._session_provisional,
+                "session_id": self._session_id,
+            }
+            self._crdt_ensure_metadata(entry)
+            facts.append(entry)
+            self._auto_link(entry, facts)
+            self._save(self._facts_path, facts)
+            self._source_track_contribution(source)
+            self._stream_append(op="LEARN", topic=topic, content=fact,
+                                confidence=confidence / 100.0, source=source)
+            return entry
+
+        # Class C — append-only coordination fact (prefer coord_claim())
+        if fact_class == "C":
+            entry = {
+                "topic": topic,
+                "fact": fact,
+                "fact_class": "C",
+                "confidence": confidence,
+                "source": source,
+                "verified": verified,
+                "created_at": now,
+                "updated_at": now,
+                "links": [],
+                "provisional": self._session_provisional,
+                "session_id": self._session_id,
+            }
+            self._crdt_ensure_metadata(entry)
+            facts.append(entry)
+            self._save(self._facts_path, facts)
+            self._source_track_contribution(source)
+            return entry
+
+        # Class B (default) — fuzzy dedup; update in place if >80% similar
         for existing in facts:
             if existing.get("topic", "").lower() != topic.lower():
                 continue
+            if existing.get("fact_class", "B") == "A":
+                continue  # never dedup-merge into a Class A fact
             sim = _similarity(existing.get("fact", ""), fact)
             if sim > 0.80:
+                # Archive the old version before updating (audit trail)
+                existing.setdefault("_archive", []).append({
+                    "fact": existing["fact"],
+                    "confidence": existing.get("confidence", 0),
+                    "updated_at": existing.get("updated_at", now),
+                })
                 # Update in place
                 existing["fact"] = fact
+                existing["fact_class"] = "B"
                 existing["confidence"] = max(existing.get("confidence", 0), confidence)
                 existing["source"] = source
                 existing["verified"] = verified or existing.get("verified", False)
@@ -447,12 +578,15 @@ class DiamondBrain:
                     existing["_crdt"].get("version", 1) + 1)
                 self._save(self._facts_path, facts)
                 self._source_track_contribution(source)
+                self._stream_append(op="LEARN", topic=topic, content=fact,
+                                    confidence=confidence / 100.0, source=source)
                 return existing
 
-        # New fact
+        # New fact (Class B)
         entry = {
             "topic": topic,
             "fact": fact,
+            "fact_class": "B",
             "confidence": confidence,
             "source": source,
             "verified": verified,
@@ -479,6 +613,9 @@ class DiamondBrain:
                 store[key] = vec
                 self._emb_save(store)
 
+        self._stream_append(op="LEARN", topic=topic, content=fact,
+                            confidence=confidence / 100.0, source=source,
+                            vector=vec if 'vec' in dir() else None)
         return entry
 
     # ------------------------------------------------------------------
@@ -904,6 +1041,291 @@ class DiamondBrain:
     # ------------------------------------------------------------------
     # prune_stale — remove facts below a freshness threshold
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Three-Lattice Coordination Ledger
+    # Provides inter-brain work claims, conflict records, and provisional
+    # session tracking for async multi-brain coordination.
+    # ------------------------------------------------------------------
+
+    def _coord_load(self) -> list:
+        try:
+            data = json.loads(self._coord_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except (json.JSONDecodeError, FileNotFoundError):
+            return []
+
+    def _coord_save(self, data: list) -> None:
+        tmp = self._coord_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(str(tmp), str(self._coord_path))
+
+    def _coord_log_conflict(self, topic: str, local_fact_id: str,
+                            incoming_fact: str, incoming_source: str,
+                            conflict_type: str = "inter-brain") -> dict:
+        """Append a conflict record to the coordination ledger."""
+        records = self._coord_load()
+        conflict = {
+            "record_type": "CONFLICT",
+            "conflict_id": f"CONFLICT-{len(records)+1:04d}",
+            "topic": topic,
+            "local_fact_id": local_fact_id,
+            "incoming_fact_preview": incoming_fact[:120],
+            "incoming_source": incoming_source,
+            "conflict_type": conflict_type,
+            "created_at": _now_iso(),
+            "resolved": False,
+            "winner_fact_id": None,
+            "resolved_by": None,
+            "resolved_at": None,
+        }
+        records.append(conflict)
+        self._coord_save(records)
+        return conflict
+
+    def coord_claim(self, task_id: str, description: str,
+                    ttl_hours: float = 4.0) -> dict:
+        """Claim a work task in the coordination ledger.
+
+        Creates an append-only claim record. If another brain has already
+        claimed this task_id, both claims coexist — the conflict is visible
+        in coord_list_claims() and flagged as CONFLICT after sync.
+
+        Args:
+            task_id:     Unique task identifier (e.g. 'carve_400_402gb')
+            description: Human-readable description of the work
+            ttl_hours:   Claim TTL. Expired claims are logged, not deleted.
+
+        Returns the claim record dict.
+        """
+        identity = self.link_identity() or {}
+        node_id = identity.get("display_name", "unknown")
+
+        records = self._coord_load()
+        # Prevent exact duplicate self-claims
+        for r in records:
+            if (r.get("record_type") == "CLAIM"
+                    and r.get("task_id") == task_id
+                    and r.get("node_id") == node_id
+                    and r.get("status") == "ACTIVE"):
+                return r
+
+        claim = {
+            "record_type": "CLAIM",
+            "claim_id": f"{node_id}-C{len(records)+1:04d}",
+            "node_id": node_id,
+            "task_id": task_id,
+            "description": description,
+            "started_at": _now_iso(),
+            "ttl_hours": ttl_hours,
+            "status": "PROVISIONAL" if self._session_provisional else "ACTIVE",
+            "provisional": self._session_provisional,
+            "session_id": self._session_id,
+        }
+        records.append(claim)
+        self._coord_save(records)
+        return claim
+
+    def coord_complete(self, task_id: str) -> bool:
+        """Mark a task claim as COMPLETE.
+
+        Returns True if a matching ACTIVE claim was found and updated.
+        """
+        identity = self.link_identity() or {}
+        node_id = identity.get("display_name", "unknown")
+        records = self._coord_load()
+        found = False
+        for r in records:
+            if (r.get("record_type") == "CLAIM"
+                    and r.get("task_id") == task_id
+                    and r.get("node_id") == node_id
+                    and r.get("status") in ("ACTIVE", "PROVISIONAL")):
+                r["status"] = "COMPLETE"
+                r["completed_at"] = _now_iso()
+                found = True
+        if found:
+            self._coord_save(records)
+        return found
+
+    def coord_expire_stale(self) -> int:
+        """Expire claims whose TTL has passed. Returns count expired."""
+        records = self._coord_load()
+        now_ts = time.time()
+        expired = 0
+        for r in records:
+            if r.get("record_type") != "CLAIM":
+                continue
+            if r.get("status") != "ACTIVE":
+                continue
+            try:
+                from datetime import datetime, timezone
+                started = datetime.fromisoformat(r["started_at"])
+                elapsed_hours = (now_ts - started.timestamp()) / 3600.0
+                if elapsed_hours >= r.get("ttl_hours", 4.0):
+                    r["status"] = "EXPIRED"
+                    r["expired_at"] = _now_iso()
+                    expired += 1
+            except Exception:
+                pass
+        if expired:
+            self._coord_save(records)
+        return expired
+
+    def coord_list_claims(self, task_id: str | None = None,
+                          status: str | None = None) -> list[dict]:
+        """Return coordination claim records, optionally filtered.
+
+        Args:
+            task_id: Filter to a specific task (None = all)
+            status:  Filter by status: ACTIVE, COMPLETE, EXPIRED, CONFLICT, PROVISIONAL
+        """
+        records = self._coord_load()
+        claims = [r for r in records if r.get("record_type") == "CLAIM"]
+        if task_id:
+            claims = [c for c in claims if c.get("task_id") == task_id]
+        if status:
+            claims = [c for c in claims if c.get("status") == status.upper()]
+        return claims
+
+    def coord_conflicts(self, resolved: bool = False) -> list[dict]:
+        """Return Class A fact conflict records.
+
+        Args:
+            resolved: If True, include resolved conflicts. Default False (open only).
+        """
+        records = self._coord_load()
+        conflicts = [r for r in records if r.get("record_type") == "CONFLICT"]
+        if not resolved:
+            conflicts = [c for c in conflicts if not c.get("resolved")]
+        return conflicts
+
+    def coord_resolve(self, conflict_id: str, winner_fact_id: str,
+                      resolved_by: str) -> bool:
+        """Mark a Class A conflict as resolved.
+
+        The winning fact_id is recorded. Both conflicting facts remain in the
+        knowledge store — nothing is deleted. The resolution is logged with
+        operator attribution for chain-of-custody.
+
+        Returns True on success.
+        """
+        records = self._coord_load()
+        for r in records:
+            if (r.get("record_type") == "CONFLICT"
+                    and r.get("conflict_id") == conflict_id
+                    and not r.get("resolved")):
+                r["resolved"] = True
+                r["winner_fact_id"] = winner_fact_id
+                r["resolved_by"] = resolved_by
+                r["resolved_at"] = _now_iso()
+                self._coord_save(records)
+                return True
+        return False
+
+    def coord_merge_remote(self, remote_claims: list[dict],
+                           peer_node_id: str) -> dict:
+        """Merge incoming coordination claims from a peer brain sync.
+
+        Appends unseen claims. Detects task_id conflicts (two nodes claiming
+        same task) and marks both CONFLICT — logged for human adjudication.
+
+        Returns: {added, conflicts_detected}
+        """
+        records = self._coord_load()
+        existing_ids = {r.get("claim_id") for r in records
+                        if r.get("record_type") == "CLAIM"}
+        added = 0
+        for rc in remote_claims:
+            if rc.get("record_type") != "CLAIM":
+                continue
+            if rc.get("claim_id") in existing_ids:
+                continue
+            records.append(rc)
+            existing_ids.add(rc.get("claim_id"))
+            added += 1
+
+        # Detect task_id conflicts: two ACTIVE claims on same task from different nodes
+        task_to_claims: dict[str, list] = {}
+        for r in records:
+            if r.get("record_type") == "CLAIM" and r.get("status") == "ACTIVE":
+                tid = r.get("task_id", "")
+                task_to_claims.setdefault(tid, []).append(r)
+
+        conflicts_detected = 0
+        for task_id, clms in task_to_claims.items():
+            nodes = {c.get("node_id") for c in clms}
+            if len(nodes) > 1:
+                for c in clms:
+                    c["status"] = "CONFLICT"
+                conflicts_detected += 1
+                # Post a conflict record
+                conflict = {
+                    "record_type": "CONFLICT",
+                    "conflict_id": f"TASK-CONFLICT-{task_id}-{_now_iso()[:10]}",
+                    "topic": f"coord:task:{task_id}",
+                    "conflict_type": "task-claim",
+                    "nodes": list(nodes),
+                    "task_id": task_id,
+                    "created_at": _now_iso(),
+                    "resolved": False,
+                    "winner_fact_id": None,
+                    "resolved_by": None,
+                    "resolved_at": None,
+                }
+                records.append(conflict)
+
+        self._coord_save(records)
+        return {"added": added, "conflicts_detected": conflicts_detected}
+
+    def coord_set_provisional(self, provisional: bool) -> None:
+        """Set session-level provisional mode.
+
+        When True: all subsequent learn() calls and coord_claim() calls are
+        tagged provisional=True. After Diamond Link reconnects and syncs,
+        call coord_set_provisional(False) to clear the flag — future facts
+        will be authoritative.
+
+        The receiving brain sees provisional facts and can flag them for
+        review before accepting as authoritative.
+        """
+        self._session_provisional = provisional
+        if provisional:
+            # Record when the link dropped in coordination ledger
+            records = self._coord_load()
+            records.append({
+                "record_type": "SESSION_EVENT",
+                "event": "LINK_DROPPED",
+                "session_id": self._session_id,
+                "at": _now_iso(),
+            })
+            self._coord_save(records)
+
+    def coord_status(self) -> dict:
+        """Return a summary of the coordination ledger state."""
+        records = self._coord_load()
+        claims = [r for r in records if r.get("record_type") == "CLAIM"]
+        conflicts = [r for r in records if r.get("record_type") == "CONFLICT"]
+        active = [c for c in claims if c.get("status") == "ACTIVE"]
+        open_conflicts = [c for c in conflicts if not c.get("resolved")]
+        return {
+            "total_claims": len(claims),
+            "active_claims": len(active),
+            "open_conflicts": len(open_conflicts),
+            "session_provisional": self._session_provisional,
+            "session_id": self._session_id,
+            "active": [{
+                "task_id": c.get("task_id"),
+                "node_id": c.get("node_id"),
+                "description": c.get("description", "")[:60],
+                "ttl_hours": c.get("ttl_hours"),
+                "status": c.get("status"),
+            } for c in active],
+            "conflicts": [{
+                "conflict_id": c.get("conflict_id"),
+                "topic": c.get("topic"),
+                "conflict_type": c.get("conflict_type"),
+            } for c in open_conflicts],
+        }
+
     def prune_stale(self, max_age_days: int = 90, min_confidence: int = 30) -> int:
         """Remove facts that are both older than *max_age_days* and have
         confidence below *min_confidence*.  Verified facts are never pruned.
@@ -3189,17 +3611,25 @@ function downloadCourtDoc() {{
                     if shared_topics and not sync_topics:
                         sync_topics = shared_topics
 
-                    # Build and send our snapshot
+                    # Build and send our snapshot (include coord claims)
                     snapshot = self._link_build_snapshot(sync_topics)
+                    coord_claims = self.coord_list_claims()
                     self._link_send_plain(conn, {
                         "type": "SYNC_RESPONSE",
                         "facts": snapshot.get("facts", []),
                         "citations": snapshot.get("citations", []),
+                        "coord_claims": coord_claims,
                     })
+
+                    # Apply incoming coord claims from peer
+                    incoming_claims = msg.get("coord_claims", [])
+                    if incoming_claims:
+                        self.coord_merge_remote(incoming_claims, req_fp[:12])
 
                     print(f"  {_C.DIM}[{ts}]{_C.RESET} {_C.WHITE}  Sent "
                           f"{len(snapshot.get('facts', []))} facts, "
-                          f"{len(snapshot.get('citations', []))} citations{_C.RESET}")
+                          f"{len(snapshot.get('citations', []))} citations, "
+                          f"{len(coord_claims)} claims{_C.RESET}")
 
                     # Receive peer's snapshot if direction=both
                     stats_received = {
@@ -3330,7 +3760,7 @@ function downloadCourtDoc() {{
             except OSError:
                 pass
 
-    def link_serve_plain(self, port: int = 7777,
+    def link_serve_plain(self, port: int = 7779,
                          max_connections: int = 10) -> None:
         """Start a plain TCP server accepting JSON+newline sync messages.
 
@@ -3449,12 +3879,14 @@ function downloadCourtDoc() {{
 
         try:
             with socket.create_connection((host, port), timeout=30) as sock:
-                # Send SYNC_REQUEST
+                # Send SYNC_REQUEST — include our coord claims
+                our_claims = self.coord_list_claims()
                 self._link_send_plain(sock, {
                     "type": "SYNC_REQUEST",
                     "fingerprint": local_fp,
                     "topics": sync_topics,
                     "direction": direction,
+                    "coord_claims": our_claims,
                 })
 
                 # Receive server's SYNC_RESPONSE
@@ -3468,10 +3900,17 @@ function downloadCourtDoc() {{
                         f"Unexpected response: {resp.get('type', '?')}"
                     )
 
+                # Apply server's coord claims first (before facts)
+                server_claims = resp.get("coord_claims", [])
+                coord_stats = {"added": 0, "conflicts_detected": 0}
+                if server_claims:
+                    coord_stats = self.coord_merge_remote(server_claims, peer_fp[:12])
+
                 # Apply server's facts
                 server_snapshot = {
                     "facts": resp.get("facts", []),
                     "citations": resp.get("citations", []),
+                    "coord_claims": [],  # already handled above
                     "source_fingerprint": peer_fp,
                 }
                 stats = self._link_apply_snapshot(
@@ -3487,6 +3926,7 @@ function downloadCourtDoc() {{
                         "type": "SYNC_RESPONSE",
                         "facts": our_snapshot.get("facts", []),
                         "citations": our_snapshot.get("citations", []),
+                        "coord_claims": our_claims,
                     })
                     facts_sent = len(our_snapshot.get("facts", []))
                     citations_sent = len(our_snapshot.get("citations", []))
@@ -5521,6 +5961,8 @@ function downloadCourtDoc() {{
                 "facts_forgotten": len(to_forget),
             })
 
+        self._stream_append(op="FORGET", topic=topic, content=fact_pattern,
+                            reason=reason, forgotten_count=len(to_forget))
         return {"forgotten_count": len(to_forget), "archived_entries": archived}
 
     def amnesia_log(self, last_n: int = 15) -> list[dict]:
@@ -6239,24 +6681,109 @@ function downloadCourtDoc() {{
     def crdt_merge_snapshot(self, snapshot: dict) -> dict:
         """CRDT-aware convergent merge of a remote snapshot.
 
-        Guarantees: commutativity, idempotency, associativity
-        via HLC total ordering.
+        Merge rules by fact_class:
+          A — Append-only. Never overwrite a local Class A with a remote one.
+              If similar content (>80%) on same topic exists locally: idempotent skip.
+              If different content (<80%): log Class A conflict, append both.
+          B — Standard CRDT: higher confidence / newer HLC wins. Loser is
+              archived in _archive list (audit trail preserved).
+          C — Append-only coordination facts. Never merged.
+
+        Guarantees: commutativity, idempotency, associativity via HLC ordering.
         """
         local_facts = self._load(self._facts_path)
         remote_facts = snapshot.get("facts", [])
         peer_fp = snapshot.get("source_fingerprint", "unknown")[:12]
 
-        stats = {"merged": 0, "added": 0, "skipped": 0}
+        # Also merge coordination claims if included in snapshot
+        remote_claims = snapshot.get("coord_claims", [])
+        if remote_claims:
+            self.coord_merge_remote(remote_claims, peer_fp)
+
+        stats = {"merged": 0, "added": 0, "skipped": 0, "conflicts": 0}
 
         for rf in remote_facts:
             rf_topic = rf.get("topic", "").lower()
             rf_fact = rf.get("fact", "")
+            rf_class = rf.get("fact_class", "B").upper()
 
+            # ── Class A: Evidence — append-only with conflict detection ──
+            if rf_class == "A":
+                # Idempotent check: same origin_node + near-exact text (>0.95)
+                # means this is the same fact being replicated — skip.
+                # Different origin_node OR different text = new attestation → append.
+                # Any existing Class A on same topic from a different origin → conflict.
+                rf_origin = rf.get("_crdt", {}).get("origin_node", "")
+                already_have = False
+                has_conflict = False
+                local_fact_id = None
+                for lf in local_facts:
+                    if lf.get("topic", "").lower() != rf_topic:
+                        continue
+                    if lf.get("fact_class", "B") != "A":
+                        continue
+                    if lf.get("_crdt", {}).get("tombstone"):
+                        continue
+                    lf_origin = lf.get("_crdt", {}).get("origin_node", "")
+                    sim = _similarity(lf.get("fact", ""), rf_fact)
+                    # Same origin node + very similar text = idempotent replicate
+                    if lf_origin and rf_origin and lf_origin == rf_origin and sim > 0.95:
+                        already_have = True
+                        break
+                    # Different origin or different content = new attestation
+                    # Flag as conflict since another Class A exists on this topic
+                    has_conflict = True
+                    local_fact_id = lf_origin or "?"
+                if already_have:
+                    stats["skipped"] += 1
+                    continue
+                # Append the remote Class A fact regardless
+                new_fact = {k: v for k, v in rf.items()
+                           if not k.startswith("_") or k == "_crdt"}
+                new_fact["source"] = f"link:{peer_fp}"
+                new_fact.setdefault("links", [])
+                self._crdt_ensure_metadata(new_fact)
+                local_facts.append(new_fact)
+                stats["added"] += 1
+                if has_conflict:
+                    # Log inter-brain Class A conflict
+                    self._coord_log_conflict(
+                        topic=rf_topic,
+                        local_fact_id=local_fact_id or "?",
+                        incoming_fact=rf_fact,
+                        incoming_source=f"link:{peer_fp}",
+                        conflict_type="inter-brain",
+                    )
+                    stats["conflicts"] += 1
+                continue
+
+            # ── Class C: Coordination — append-only, no merge ───────────
+            if rf_class == "C":
+                # Only append if we don't have this exact fact already
+                crdt_id = rf.get("_crdt", {}).get("id", "")
+                if crdt_id and any(
+                    lf.get("_crdt", {}).get("id") == crdt_id
+                    for lf in local_facts
+                ):
+                    stats["skipped"] += 1
+                    continue
+                new_fact = {k: v for k, v in rf.items()
+                           if not k.startswith("_") or k == "_crdt"}
+                new_fact["source"] = f"link:{peer_fp}"
+                new_fact.setdefault("links", [])
+                self._crdt_ensure_metadata(new_fact)
+                local_facts.append(new_fact)
+                stats["added"] += 1
+                continue
+
+            # ── Class B (default): confidence-weighted merge ─────────────
             match = None
             match_idx = None
             for i, lf in enumerate(local_facts):
                 if lf.get("topic", "").lower() != rf_topic:
                     continue
+                if lf.get("fact_class", "B") == "A":
+                    continue  # Never merge into Class A
                 sim = _similarity(lf.get("fact", ""), rf_fact)
                 if sim > 0.80:
                     match = lf
@@ -6274,6 +6801,13 @@ function downloadCourtDoc() {{
             else:
                 winner = self._crdt_merge_fact(match, rf)
                 if winner == "remote":
+                    # Archive the losing local version (audit trail)
+                    local_facts[match_idx].setdefault("_archive", []).append({
+                        "fact": local_facts[match_idx].get("fact", ""),
+                        "confidence": local_facts[match_idx].get("confidence", 0),
+                        "archived_at": _now_iso(),
+                        "archived_by": f"link-merge:{peer_fp}",
+                    })
                     for k, v in rf.items():
                         if not k.startswith("_") or k == "_crdt":
                             local_facts[match_idx][k] = v
@@ -6769,6 +7303,8 @@ function downloadCourtDoc() {{
             f_copy = dict(fact_map[key])
             f_copy["_semantic_score"] = round(float(sim), 4)
             results.append(f_copy)
+        self._stream_append(op="QUERY", topic="__search__", content=query,
+                            strategy="semantic", result_count=len(results))
         return results
 
     # ==================================================================
@@ -10058,7 +10594,7 @@ if __name__ == "__main__":
 
     # CLI: --link-serve-plain [--port N]
     if len(sys.argv) >= 2 and sys.argv[1] == "--link-serve-plain":
-        lsp_port = 7777
+        lsp_port = 7779
         if "--port" in sys.argv:
             idx = sys.argv.index("--port")
             if idx + 1 < len(sys.argv):

@@ -1,0 +1,38 @@
+# Diamond Brain storage (auto-created at runtime)
+brain/memory/*.json
+brain/memory/link/
+brain/memory/blobs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Generated reports
+diamond_brain_report.html
+*.html.tmp
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Backup files
+*.bak
+*.bak_*
+caddy_bypass.md
