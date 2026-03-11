@@ -36,3 +36,4 @@ Thumbs.db
 *.bak
 *.bak_*
 caddy_bypass.md
+.github/workflows/
