@@ -1,7 +1,7 @@
 """
-memory_stream.py — Diamond Brain encrypted append-log (Phase 1)
+memory_stream.py — Diamond Brain encrypted append-log (Phase 1 + 2)
 
-Implements:
+Phase 1:
   - AES-256-GCM encrypted segments (one per session)
   - Argon2id key derivation (passphrase → master_key → session_key via HKDF)
   - NDJSON event schema with bi-temporal fields
@@ -10,21 +10,29 @@ Implements:
   - verify_chain() — forensic integrity check
   - MemoryStream.append() / read_events() / stream_connect()
 
-Phase 2 (not here): StreamBroker (Unix socket pub/sub), Compactor, DiamondBrain hooks.
+Phase 2:
+  - StreamBroker — Unix socket pub/sub, live fanout + replay on reconnect
+  - Compactor — Gen0→Gen1→Gen2 nightly LLM summarization pipeline
+  - Checkpoint — encrypted Gen2 snapshot for fast cold-start (save/load)
+  - MemoryStream.broker — auto-fanout on every append
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+import select
+import socket
 import struct
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 
 # ── Crypto deps (both already installed) ─────────────────────────────────────
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -192,6 +200,7 @@ class MemoryStream:
         self._session_events: list[bytes]  = []  # buffered NDJSON lines for current session
         self._prev_hash: str = GENESIS_HASH
         self._segment_offset: int = 0
+        self._broker: Optional["StreamBroker"] = None
         self._ensure_log_header()
 
     # ── Header ────────────────────────────────────────────────────────────
@@ -299,7 +308,7 @@ class MemoryStream:
         )
 
     def _append_raw(self, op: str, topic: str, content: str, extra: dict) -> dict:
-        """Build event dict, compute chain hash, buffer as NDJSON."""
+        """Build event dict, compute chain hash, buffer as NDJSON, fan out to broker."""
         event: dict = {
             "id":                 _event_id(),
             "op":                 op,
@@ -318,7 +327,77 @@ class MemoryStream:
         raw         = _serialize(event)
         self._prev_hash = _sha256_hex(raw)
         self._session_events.append(raw)
+
+        # Live fanout to any connected subscribers
+        if self._broker is not None:
+            self._broker.fanout(event)
+
         return event
+
+    # ── Broker integration ────────────────────────────────────────────
+
+    def start_broker(self) -> "StreamBroker":
+        """Start the Unix socket pub/sub broker and attach it to this stream."""
+        if self._broker is None:
+            self._broker = StreamBroker()
+        self._broker.start()
+        return self._broker
+
+    def stop_broker(self) -> None:
+        if self._broker:
+            self._broker.stop()
+            self._broker = None
+
+    @property
+    def broker(self) -> Optional["StreamBroker"]:
+        return self._broker
+
+    # ── Checkpoint ────────────────────────────────────────────────────
+
+    def save_checkpoint(self) -> Path:
+        """Encrypt and write a Gen2 snapshot to memory_stream.checkpoint."""
+        facts = [
+            e for e in self.read_events(gen=2, op="COMPACT")
+            if e.get("ts_sys_invalidated") is None
+        ]
+        checkpoint_path = self.memory_dir / "memory_stream.checkpoint"
+        meta = {
+            "event_ids":  [e.get("id", "") for e in facts],
+            "topics":     [e.get("topic", "") for e in facts],
+            "contents":   [e.get("content", "") for e in facts],
+            "timestamps": [e.get("ts_sys_created", 0.0) for e in facts],
+            "vectors":    [e.get("vector") for e in facts],
+            "as_of_ts":   _now_ts(),
+        }
+        nonce       = os.urandom(NONCE_LEN)
+        plaintext   = json.dumps(meta, ensure_ascii=False).encode()
+        aesgcm      = AESGCM(self._master_key)
+        ciphertext  = aesgcm.encrypt(nonce, plaintext, None)
+        tmp         = checkpoint_path.with_suffix(".tmp")
+        with open(tmp, "wb") as f:
+            f.write(nonce + struct.pack(">I", len(ciphertext)) + ciphertext)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, checkpoint_path)
+        return checkpoint_path
+
+    def load_checkpoint(self) -> dict:
+        """Decrypt and return the Gen2 checkpoint dict, or an empty skeleton."""
+        empty = {"event_ids": [], "topics": [], "contents": [],
+                 "timestamps": [], "vectors": [], "as_of_ts": 0.0}
+        checkpoint_path = self.memory_dir / "memory_stream.checkpoint"
+        if not checkpoint_path.exists():
+            return empty
+        with open(checkpoint_path, "rb") as f:
+            nonce   = f.read(NONCE_LEN)
+            length  = struct.unpack(">I", f.read(LEN_PREFIX))[0]
+            cipher  = f.read(length)
+        try:
+            aesgcm    = AESGCM(self._master_key)
+            plaintext = aesgcm.decrypt(nonce, cipher, None)
+        except Exception as exc:
+            raise DecryptionError(f"Checkpoint decrypt failed: {exc}") from exc
+        return json.loads(plaintext.decode())
 
     # ── Read ──────────────────────────────────────────────────────────────
 
@@ -505,6 +584,342 @@ def stream_connect(
     return stream, ctx
 
 
+# ── StreamBroker — Unix socket pub/sub ────────────────────────────────────────
+
+_LOG = logging.getLogger("diamond.stream.broker")
+
+
+@dataclass
+class _ClientState:
+    sock:        socket.socket
+    topics:      list[str]    = field(default_factory=lambda: ["*"])
+    last_ack:    int          = 0
+    buf:         bytes        = b""
+
+
+class StreamBroker:
+    """
+    Background Unix socket pub/sub broker.
+
+    Consumers connect to ~/.local/share/diamond-brain/stream.sock and send:
+        {"op": "SUBSCRIBE", "from_offset": 0, "topics": ["fraud", "*"]}
+
+    Server pushes live events:
+        {"op": "EVENT", "offset": N, "event": {...}}
+
+    Consumers ack (optional, for durable delivery):
+        {"op": "ACK", "offset": N}
+
+    Disconnected consumers resume from their last ACK'd offset on reconnect.
+    """
+
+    SOCK_DIR  = Path.home() / ".local/share/diamond-brain"
+    SOCK_NAME = "stream.sock"
+
+    def __init__(self) -> None:
+        self._clients: dict[int, _ClientState] = {}   # fileno → state
+        self._lock    = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._stop    = threading.Event()
+        self._log: list[dict] = []                    # ordered event history for replay
+        self._sock_path = self.SOCK_DIR / self.SOCK_NAME
+
+    @property
+    def sock_path(self) -> Path:
+        return self._sock_path
+
+    @property
+    def event_count(self) -> int:
+        return len(self._log)
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self.SOCK_DIR.mkdir(parents=True, exist_ok=True)
+        self._sock_path.unlink(missing_ok=True)
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="StreamBroker"
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        try:
+            self._sock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def fanout(self, event: dict) -> None:
+        """Append event to log and push to all matching subscribers. Thread-safe."""
+        with self._lock:
+            self._log.append(event)
+            offset = len(self._log) - 1
+            dead   = []
+            for fno, state in self._clients.items():
+                if not self._matches(event.get("topic", ""), state.topics):
+                    continue
+                msg = json.dumps({"op": "EVENT", "offset": offset, "event": event}) + "\n"
+                try:
+                    state.sock.sendall(msg.encode())
+                except OSError:
+                    dead.append(fno)
+            for fno in dead:
+                self._close_client(fno)
+
+    # ── Internal ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _matches(topic: str, filters: list[str]) -> bool:
+        return "*" in filters or topic in filters
+
+    def _close_client(self, fno: int) -> None:
+        state = self._clients.pop(fno, None)
+        if state:
+            try:
+                state.sock.close()
+            except OSError:
+                pass
+
+    def _run(self) -> None:
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            server.bind(str(self._sock_path))
+        except OSError as e:
+            _LOG.error("StreamBroker bind failed: %s", e)
+            return
+        server.listen(16)
+        server.setblocking(False)
+
+        try:
+            while not self._stop.is_set():
+                with self._lock:
+                    client_socks = [s.sock for s in self._clients.values()]
+                try:
+                    readable, _, _ = select.select(
+                        [server] + client_socks, [], [], 0.5
+                    )
+                except (OSError, ValueError):
+                    break
+                for ready in readable:
+                    if ready is server:
+                        try:
+                            conn, _ = server.accept()
+                            conn.setblocking(False)
+                            with self._lock:
+                                self._clients[conn.fileno()] = _ClientState(sock=conn)
+                        except OSError:
+                            pass
+                    else:
+                        self._handle_recv(ready)
+        finally:
+            server.close()
+
+    def _handle_recv(self, sock: socket.socket) -> None:
+        fno = sock.fileno()
+        with self._lock:
+            state = self._clients.get(fno)
+        if not state:
+            return
+        try:
+            data = sock.recv(4096)
+            if not data:
+                raise OSError("peer closed")
+            state.buf += data
+            while b"\n" in state.buf:
+                line, state.buf = state.buf.split(b"\n", 1)
+                try:
+                    self._dispatch(state, json.loads(line))
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        except OSError:
+            with self._lock:
+                self._close_client(fno)
+
+    def _dispatch(self, state: _ClientState, msg: dict) -> None:
+        op = msg.get("op")
+        if op == "SUBSCRIBE":
+            state.topics    = msg.get("topics", ["*"])
+            from_offset     = int(msg.get("from_offset", 0))
+            with self._lock:
+                replay = [
+                    (i, e) for i, e in enumerate(self._log)
+                    if i >= from_offset and self._matches(e.get("topic", ""), state.topics)
+                ]
+            for offset, event in replay:
+                out = json.dumps({"op": "EVENT", "offset": offset, "event": event}) + "\n"
+                try:
+                    state.sock.sendall(out.encode())
+                except OSError:
+                    break
+        elif op == "ACK":
+            state.last_ack = int(msg.get("offset", state.last_ack))
+
+
+# ── Compactor — Gen0→Gen1→Gen2 pipeline ───────────────────────────────────────
+
+class Compactor:
+    """
+    LightMem-inspired generational compaction.
+
+    Gen0 (raw LEARN events today) → Gen1 (daily topic summaries) → Gen2 (distilled long-term facts).
+
+    Usage:
+        compactor = Compactor(stream, summarize_fn=brain.cortex_summarize)
+        compactor.compact_gen0_to_gen1()   # call nightly
+        compactor.compact_gen1_to_gen2()   # call weekly
+        stream.save_checkpoint()            # persist Gen2 snapshot
+    """
+
+    def __init__(
+        self,
+        stream: "MemoryStream",
+        summarize_fn: Optional[Callable[[str, list[dict]], str]] = None,
+    ) -> None:
+        self._stream    = stream
+        self._summarize = summarize_fn or self._fallback_summarize
+
+    @staticmethod
+    def _fallback_summarize(topic: str, events: list[dict]) -> str:
+        """Concatenate fact contents when no LLM is available."""
+        contents = [e.get("content", "") for e in events if e.get("content")]
+        prefix   = f"[{topic}] "
+        return prefix + " | ".join(contents[:8])
+
+    def compact_gen0_to_gen1(self, cutoff_ts: Optional[float] = None) -> dict:
+        """
+        Summarize Gen0 LEARN events older than cutoff_ts into Gen1 propositions.
+
+        Args:
+            cutoff_ts: Unix timestamp; only process events before this point.
+                       Defaults to 24h ago (yesterday's events).
+
+        Returns:
+            {"compacted": N, "topics": [...]}
+        """
+        cutoff = cutoff_ts if cutoff_ts is not None else (time.time() - 86400)
+
+        live_events = [
+            e for e in self._stream.read_events(op="LEARN", gen=0)
+            if e.get("ts_sys_created", 0) <= cutoff
+            and e.get("ts_sys_invalidated") is None
+        ]
+        if not live_events:
+            return {"compacted": 0, "topics": []}
+
+        by_topic: dict[str, list[dict]] = {}
+        for e in live_events:
+            by_topic.setdefault(e.get("topic", "unknown"), []).append(e)
+
+        compacted = 0
+        for topic, events in by_topic.items():
+            summary    = self._summarize(topic, events)
+            source_ids = [e.get("id", "") for e in events]
+            avg_conf   = sum(e.get("confidence", 0.9) for e in events) / len(events)
+            self._stream._append_raw(
+                op="COMPACT",
+                topic=topic,
+                content=summary,
+                extra={
+                    "gen":              1,
+                    "gen_from":         0,
+                    "gen_to":           1,
+                    "source_event_ids": source_ids,
+                    "event_count":      len(events),
+                    "confidence":       round(avg_conf, 3),
+                    "source":           "compactor",
+                    "ts_valid_from":    _today_str(),
+                },
+            )
+            self._invalidate(source_ids)
+            compacted += len(events)
+
+        return {"compacted": compacted, "topics": list(by_topic.keys())}
+
+    def compact_gen1_to_gen2(self) -> dict:
+        """
+        Distill live Gen1 events into Gen2 long-term facts.
+        Deduplicates by vector cosine similarity (>0.95 = same fact).
+
+        Returns:
+            {"compacted": N, "topics": [...]}
+        """
+        live_events = [
+            e for e in self._stream.read_events(gen=1, op="COMPACT")
+            if e.get("ts_sys_invalidated") is None
+        ]
+        if not live_events:
+            return {"compacted": 0, "topics": []}
+
+        by_topic: dict[str, list[dict]] = {}
+        for e in live_events:
+            by_topic.setdefault(e.get("topic", "unknown"), []).append(e)
+
+        compacted = 0
+        for topic, events in by_topic.items():
+            unique     = _dedup_by_vector(events)
+            summary    = self._summarize(topic, unique)
+            source_ids = [e.get("id", "") for e in unique]
+            avg_conf   = sum(e.get("confidence", 0.9) for e in unique) / len(unique)
+            self._stream._append_raw(
+                op="COMPACT",
+                topic=topic,
+                content=summary,
+                extra={
+                    "gen":              2,
+                    "gen_from":         1,
+                    "gen_to":           2,
+                    "source_event_ids": source_ids,
+                    "event_count":      len(unique),
+                    "confidence":       round(avg_conf, 3),
+                    "source":           "compactor",
+                    "ts_valid_from":    _today_str(),
+                },
+            )
+            self._invalidate(source_ids)
+            compacted += len(unique)
+
+        return {"compacted": compacted, "topics": list(by_topic.keys())}
+
+    def _invalidate(self, event_ids: list[str]) -> None:
+        now = _now_ts()
+        for eid in event_ids:
+            self._stream._append_raw(
+                op="INVALIDATE",
+                topic="__meta__",
+                content="",
+                extra={"target_id": eid, "invalidated_at": now, "source": "compactor"},
+            )
+
+
+def _dedup_by_vector(events: list[dict], threshold: float = 0.95) -> list[dict]:
+    """Remove near-duplicate events by cosine similarity on their 'vector' field."""
+    unique: list[dict] = []
+    for evt in events:
+        vec = evt.get("vector")
+        if not vec:
+            unique.append(evt)
+            continue
+        is_dup = any(
+            _cosine_sim(vec, u["vector"]) > threshold
+            for u in unique
+            if u.get("vector")
+        )
+        if not is_dup:
+            unique.append(evt)
+    return unique
+
+
+def _cosine_sim(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na  = sum(x * x for x in a) ** 0.5
+    nb  = sum(x * x for x in b) ** 0.5
+    return dot / (na * nb) if na and nb else 0.0
+
+
 # ── CLI smoke interface ────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -519,9 +934,22 @@ if __name__ == "__main__":
     p_replay = sub.add_parser("replay", help="Print all events since timestamp")
     p_replay.add_argument("--dir", default=None)
     p_replay.add_argument("--since", type=float, default=0.0)
+    p_replay.add_argument("--op", default=None, help="Filter by op type")
+    p_replay.add_argument("--topic", default=None, help="Filter by topic")
 
     p_write = sub.add_parser("write-test", help="Write a test event")
     p_write.add_argument("--dir", default=None)
+
+    p_compact = sub.add_parser("compact", help="Run compaction pipeline")
+    p_compact.add_argument("--dir", default=None)
+    p_compact.add_argument("--gen", choices=["0to1", "1to2", "full"], default="full",
+                           help="Which compaction stage to run (default: full)")
+
+    p_checkpoint = sub.add_parser("checkpoint", help="Save a Gen2 checkpoint")
+    p_checkpoint.add_argument("--dir", default=None)
+
+    p_broker = sub.add_parser("broker", help="Start the Unix socket pub/sub broker")
+    p_broker.add_argument("--dir", default=None)
 
     args   = parser.parse_args()
     phrase = getpass.getpass("Passphrase: ")
@@ -541,7 +969,9 @@ if __name__ == "__main__":
     elif args.cmd == "replay":
         s = MemoryStream(mem_dir, phrase)
         count = 0
-        for evt in s.read_events(since_ts=args.since):
+        for evt in s.read_events(since_ts=args.since,
+                                  op=getattr(args, "op", None),
+                                  topic=getattr(args, "topic", None)):
             print(json.dumps(evt, indent=2))
             count += 1
         print(f"\n{count} events replayed.")
@@ -553,6 +983,38 @@ if __name__ == "__main__":
         sym = "✓" if ok else "✗"
         print(f"{sym} Chain verify: {msg}  ({len(events)} events)")
         sys.exit(0 if ok else 1)
+
+    elif args.cmd == "compact":
+        s = MemoryStream(mem_dir, phrase)
+        s.open_session()
+        comp = Compactor(s)
+        stage = args.gen
+        if stage in ("0to1", "full"):
+            r = comp.compact_gen0_to_gen1()
+            print(f"Gen0→Gen1: {r['compacted']} events → {len(r['topics'])} topics")
+        if stage in ("1to2", "full"):
+            r = comp.compact_gen1_to_gen2()
+            print(f"Gen1→Gen2: {r['compacted']} events → {len(r['topics'])} topics")
+        s.close_session()
+
+    elif args.cmd == "checkpoint":
+        s = MemoryStream(mem_dir, phrase)
+        path = s.save_checkpoint()
+        print(f"Checkpoint saved: {path}")
+
+    elif args.cmd == "broker":
+        import signal
+        s = MemoryStream(mem_dir, phrase)
+        broker = s.start_broker()
+        print(f"StreamBroker listening on {broker.sock_path}")
+        print("Press Ctrl+C to stop.")
+        def _shutdown(*_):
+            s.stop_broker()
+            sys.exit(0)
+        signal.signal(signal.SIGINT, _shutdown)
+        signal.signal(signal.SIGTERM, _shutdown)
+        while True:
+            time.sleep(1)
 
     else:
         parser.print_help()

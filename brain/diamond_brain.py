@@ -549,6 +549,9 @@ class DiamondBrain:
             facts.append(entry)
             self._save(self._facts_path, facts)
             self._source_track_contribution(source)
+            self._stream_append(op="LEARN", topic=topic, content=fact,
+                                confidence=confidence / 100.0, source=source,
+                                fact_class="C")
             return entry
 
         # Class B (default) — fuzzy dedup; update in place if >80% similar
